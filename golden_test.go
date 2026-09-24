@@ -23,6 +23,7 @@ type vecHeader struct {
 	Pmax      int64  `json:"pmax"`
 	MaxOrders int    `json:"max_orders"`
 	Index     string `json:"index"`
+	Engine    bool   `json:"engine"`
 }
 
 func parseHeader(t *testing.T, line string) vecHeader {
@@ -39,10 +40,14 @@ func parseHeader(t *testing.T, line string) vecHeader {
 	return h
 }
 
-func parseCmd(t *testing.T, line string) Command {
+func parseCmd(t *testing.T, line string) (uint32, Command) {
 	var v map[string]any
 	if err := json.Unmarshal([]byte(line), &v); err != nil {
 		t.Fatalf("cmd: %v", err)
+	}
+	var sym uint32
+	if sv, ok := v["symbol"]; ok {
+		sym = uint32(sv.(float64))
 	}
 	u := func(k string) uint64 { return uint64(v[k].(float64)) }
 	i := func(k string) int64 { return int64(v[k].(float64)) }
@@ -66,14 +71,14 @@ func parseCmd(t *testing.T, line string) Command {
 		case "post_only":
 			tif = PostOnly
 		}
-		return Command{Kind: CmdNew, OrderID: u("order_id"), Side: side, OType: ot, Price: i("price"), Qty: u("qty"), Tif: tif}
+		return sym, Command{Kind: CmdNew, OrderID: u("order_id"), Side: side, OType: ot, Price: i("price"), Qty: u("qty"), Tif: tif}
 	case "cancel":
-		return Command{Kind: CmdCancel, OrderID: u("order_id")}
+		return sym, Command{Kind: CmdCancel, OrderID: u("order_id")}
 	case "replace":
-		return Command{Kind: CmdReplace, OrderID: u("order_id"), Price: i("price"), Qty: u("qty")}
+		return sym, Command{Kind: CmdReplace, OrderID: u("order_id"), Price: i("price"), Qty: u("qty")}
 	}
 	t.Fatalf("bad cmd: %s", line)
-	return Command{}
+	return 0, Command{}
 }
 
 func runVector(t *testing.T, cmdPath string, kind IndexKind) [][]byte {
@@ -87,6 +92,23 @@ func runVector(t *testing.T, cmdPath string, kind IndexKind) [][]byte {
 	sc.Scan()
 	h := parseHeader(t, sc.Text())
 	cfg := BookConfig{PriceMin: h.Pmin, PriceMax: h.Pmax, MaxOrders: h.MaxOrders, Index: kind}
+	if h.Engine {
+		eng := NewEngine(cfg)
+		var out [][]byte
+		for sc.Scan() {
+			line := sc.Text()
+			if line == "" {
+				continue
+			}
+			sym, cmd := parseCmd(t, line)
+			eng.SubmitTagged(sym, cmd, func(s uint32, seq uint64, ev *Event) {
+				var buf []byte
+				ev.WriteCanonicalSym(seq, s, &buf)
+				out = append(out, buf)
+			})
+		}
+		return out
+	}
 	book := NewOrderBook(cfg)
 	sink := &LinesSink{}
 	for sc.Scan() {
@@ -94,7 +116,8 @@ func runVector(t *testing.T, cmdPath string, kind IndexKind) [][]byte {
 		if line == "" {
 			continue
 		}
-		book.Apply(parseCmd(t, line), sink)
+		_, cmd := parseCmd(t, line)
+		book.Apply(cmd, sink)
 	}
 	return sink.Lines
 }

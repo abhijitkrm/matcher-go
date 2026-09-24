@@ -170,23 +170,37 @@ type Event struct {
 }
 
 // WriteCanonical appends the event's canonical JSON line (SCHEMA.md), no newline.
-func (e *Event) WriteCanonical(seq uint64, buf *[]byte) {
+func (e *Event) WriteCanonical(seq uint64, buf *[]byte) { e.write(seq, nil, buf) }
+
+// WriteCanonicalSym emits the `engine:true` line: `"symbol":N` after `ev`.
+func (e *Event) WriteCanonicalSym(seq uint64, sym uint32, buf *[]byte) {
+	sf := appendUint([]byte(`,"symbol":`), uint64(sym))
+	e.write(seq, sf, buf)
+}
+
+func (e *Event) write(seq uint64, symField []byte, buf *[]byte) {
 	*buf = append(*buf, `{"seq":`...)
 	*buf = appendUint(*buf, seq)
 	switch e.Kind {
 	case EvAccepted:
-		*buf = append(*buf, `,"ev":"accepted","order_id":`...)
+		*buf = append(*buf, `,"ev":"accepted"`...)
+		*buf = append(*buf, symField...)
+		*buf = append(*buf, `,"order_id":`...)
 		*buf = appendUint(*buf, e.OrderID)
 		*buf = append(*buf, `,"leaves_qty":`...)
 		*buf = appendUint(*buf, e.LeavesQty)
 	case EvRejected:
-		*buf = append(*buf, `,"ev":"rejected","order_id":`...)
+		*buf = append(*buf, `,"ev":"rejected"`...)
+		*buf = append(*buf, symField...)
+		*buf = append(*buf, `,"order_id":`...)
 		*buf = appendUint(*buf, e.OrderID)
 		*buf = append(*buf, `,"reason":"`...)
 		*buf = append(*buf, RejectReason(e.Reason).String()...)
 		*buf = append(*buf, '"')
 	case EvTrade:
-		*buf = append(*buf, `,"ev":"trade","maker":`...)
+		*buf = append(*buf, `,"ev":"trade"`...)
+		*buf = append(*buf, symField...)
+		*buf = append(*buf, `,"maker":`...)
 		*buf = appendUint(*buf, e.Maker)
 		*buf = append(*buf, `,"taker":`...)
 		*buf = appendUint(*buf, e.Taker)
@@ -195,13 +209,17 @@ func (e *Event) WriteCanonical(seq uint64, buf *[]byte) {
 		*buf = append(*buf, `,"qty":`...)
 		*buf = appendUint(*buf, e.Qty)
 	case EvClosed:
-		*buf = append(*buf, `,"ev":"closed","order_id":`...)
+		*buf = append(*buf, `,"ev":"closed"`...)
+		*buf = append(*buf, symField...)
+		*buf = append(*buf, `,"order_id":`...)
 		*buf = appendUint(*buf, e.OrderID)
 		*buf = append(*buf, `,"reason":"`...)
 		*buf = append(*buf, CloseReason(e.Reason).String()...)
 		*buf = append(*buf, '"')
 	case EvReplaced:
-		*buf = append(*buf, `,"ev":"replaced","order_id":`...)
+		*buf = append(*buf, `,"ev":"replaced"`...)
+		*buf = append(*buf, symField...)
+		*buf = append(*buf, `,"order_id":`...)
 		*buf = appendUint(*buf, e.OrderID)
 		*buf = append(*buf, `,"price":`...)
 		*buf = appendInt(*buf, e.Price)
