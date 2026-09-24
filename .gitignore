@@ -1,0 +1,6 @@
+bench/
+*.run.cmd.jsonl
+*.setup.cmd.jsonl
+target/
+matcherbench
+.DS_Store
