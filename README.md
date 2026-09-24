@@ -5,7 +5,8 @@
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
 Deterministic FIFO limit order book and matching engine core for Go —
-a port of the reference [Rust implementation](https://github.com/abhijitkrm/matcher-rust).
+measured at up to **~9M orders/sec** on Apple M1 (single-threaded, see
+`spec/BENCH.md`).
 
 Single-writer book per symbol, commands in, monotonically sequenced events out.
 All I/O hangs off the `Sink` seam; there is no networking, persistence, or
@@ -35,10 +36,8 @@ go get github.com/abhijitkrm/matcher-go@latest
 - FIFO price-time priority, maker-price execution, partial fills, sweeps
 - Pooled orders, intrusive FIFO price levels, bitmap ladder index
 - Thin multi-symbol `Engine` router
-- Deterministic event streams — byte-identical to the
-  [Rust](https://github.com/abhijitkrm/matcher-rust) and
-  [C++](https://github.com/abhijitkrm/matcher-cpp) implementations, verified
-  against the shared golden vector corpus (`vectors/`)
+- Deterministic event streams — verified byte-identically against the shared
+  golden vector corpus (`vectors/`)
 
 ## Layout
 
@@ -47,7 +46,7 @@ go get github.com/abhijitkrm/matcher-go@latest
 cmd/matcherbench/  benchmark harness
 vectors/        shared golden corpus (spec repo: github.com/abhijitkrm/matcher)
 spec/           semantics contract (SPEC.md, SCHEMA.md, BENCH.md)
-tools/          vectorgen — deterministic workload generator (Rust tool)
+tools/          vectorgen — deterministic workload generator
 ```
 
 ## Test & bench
@@ -55,7 +54,7 @@ tools/          vectorgen — deterministic workload generator (Rust tool)
 ```bash
 go test ./...       # 41 golden vectors
 
-# benchmark — vectorgen is a small Rust tool (see spec/BENCH.md)
+# benchmark (see spec/BENCH.md)
 mkdir -p bench
 cargo run --release --manifest-path tools/vectorgen/Cargo.toml -- \
   --workload w2 --n 200000 --setup-n 100000 --out bench/w2
