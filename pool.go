@@ -7,6 +7,7 @@ type order struct {
 	side  Side
 	price int64
 	qty   uint64
+	tif   Tif
 	prev  uint32
 	next  uint32
 }

@@ -1,5 +1,9 @@
 package matcher
 
+import (
+	"sort"
+)
+
 // Engine is a thin multi-symbol router: one book per symbol, each its own
 // single-writer domain (the exchange partitioning model).
 type Engine struct {
@@ -18,6 +22,17 @@ func (e *Engine) AddSymbol(sym uint32, cfg BookConfig) {
 }
 
 func (e *Engine) Book(sym uint32) *OrderBook { return e.books[sym] }
+
+// Symbols returns the live symbols in ascending order (deterministic for
+// snapshot serialization).
+func (e *Engine) Symbols() []uint32 {
+	syms := make([]uint32, 0, len(e.books))
+	for s := range e.books {
+		syms = append(syms, s)
+	}
+	sort.Slice(syms, func(i, j int) bool { return syms[i] < syms[j] })
+	return syms
+}
 
 // Submit routes a command to sym's book; events flow to sink.
 func (e *Engine) Submit(sym uint32, cmd Command, sink Sink) {

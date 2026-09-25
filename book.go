@@ -86,7 +86,7 @@ func (b *OrderBook) newOrder(cmd Command, sink Sink) {
 	case remaining == 0:
 		b.emit(sink, Event{Kind: EvClosed, OrderID: oid, Reason: uint8(Filled)})
 	case cmd.OType == Limit && (cmd.Tif == Gtc || cmd.Tif == PostOnly):
-		b.rest(oid, cmd.Side, cmd.Price, remaining)
+		b.rest(oid, cmd.Side, cmd.Price, remaining, cmd.Tif)
 		b.emit(sink, Event{Kind: EvAccepted, OrderID: oid, LeavesQty: remaining})
 	default:
 		b.emit(sink, Event{Kind: EvClosed, OrderID: oid, Reason: uint8(Expired)})
@@ -226,13 +226,13 @@ func (b *OrderBook) cross(side Side, hasBound bool, bound int64, taker uint64, q
 }
 
 // rest inserts a remainder as a resting order (slot guaranteed by book_full).
-func (b *OrderBook) rest(oid uint64, side Side, price int64, qty uint64) {
+func (b *OrderBook) rest(oid uint64, side Side, price int64, qty uint64, tif Tif) {
 	idx, ok := b.pool.alloc()
 	if !ok {
 		// Unreachable: ingest checked live < MaxOrders and matching only frees.
 		return
 	}
-	b.pool.slots[idx] = order{id: oid, side: side, price: price, qty: qty, prev: NIL, next: NIL}
+	b.pool.slots[idx] = order{id: oid, side: side, price: price, qty: qty, tif: tif, prev: NIL, next: NIL}
 	own := b.ownIndex(side)
 	lv := own.levelInsert(price)
 	b.pool.levelPush(lv, idx)
@@ -309,4 +309,52 @@ func (b *OrderBook) Order(oid uint64) (OrderInfo, bool) {
 	}
 	o := &b.pool.slots[idx]
 	return OrderInfo{OrderID: o.id, Side: o.side, Price: o.price, Qty: o.qty}, true
+}
+
+// RestingOrder is one live order for snapshot serialization.
+type RestingOrder struct {
+	OrderID uint64
+	Side    Side
+	Price   int64
+	Qty     uint64
+	Tif     Tif
+}
+
+// RestingOrders returns all live orders in book order: bids best→worst then
+// asks best→worst, FIFO within each level.
+func (b *OrderBook) RestingOrders() []RestingOrder {
+	out := make([]RestingOrder, 0, b.pool.live)
+	for _, side := range []Side{Bid, Ask} {
+		idx := b.ownIndex(side)
+		for _, d := range idx.depth(1 << 30) {
+			lv := idx.levelMut(d.Price)
+			for i := lv.head; i != NIL; i = b.pool.slots[i].next {
+				o := &b.pool.slots[i]
+				out = append(out, RestingOrder{
+					OrderID: o.id, Side: o.side, Price: o.price, Qty: o.qty, Tif: o.tif,
+				})
+			}
+		}
+	}
+	return out
+}
+
+// Restore rebuilds a book from a snapshot: same config, explicit seq, and
+// resting orders replayed in snapshot order (bids then asks, FIFO per level).
+func Restore(cfg BookConfig, seq uint64, orders []RestingOrder) *OrderBook {
+	b := NewOrderBook(cfg)
+	b.seq = seq
+	for _, o := range orders {
+		idx, ok := b.pool.alloc()
+		if !ok {
+			return b
+		}
+		b.pool.slots[idx] = order{
+			id: o.OrderID, side: o.Side, price: o.Price, qty: o.Qty,
+			tif: o.Tif, prev: NIL, next: NIL,
+		}
+		b.pool.levelPush(b.ownIndex(o.Side).levelInsert(o.Price), idx)
+		b.omap[o.OrderID] = idx
+	}
+	return b
 }
