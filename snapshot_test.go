@@ -205,7 +205,7 @@ func TestSnapshotMidFuzzStream(t *testing.T) {
 
 // RestingOrders asks depth for every level (n = 1<<30); depth must size its
 // result by the levels present, not by n (it used to allocate n entries:
-// 24 GB per book per snapshot).
+// 16 GiB per side, per book, per snapshot; the commit that fixed it says 24 GB).
 func TestRestingOrdersAllocatesByLevels(t *testing.T) {
 	b := NewOrderBook(DefaultConfig())
 	b.Apply(NewLimit(1, Bid, 100, 5, Gtc), &NullSink{})
