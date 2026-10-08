@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -199,5 +200,24 @@ func TestSnapshotMidFuzzStream(t *testing.T) {
 		if !bytes.Equal(out[i], expected[i]) {
 			t.Fatalf("event %d diverged:\n got %s\nwant %s", i, out[i], expected[i])
 		}
+	}
+}
+
+// RestingOrders asks depth for every level (n = 1<<30); depth must size its
+// result by the levels present, not by n (it used to allocate n entries:
+// 24 GB per book per snapshot).
+func TestRestingOrdersAllocatesByLevels(t *testing.T) {
+	b := NewOrderBook(DefaultConfig())
+	b.Apply(NewLimit(1, Bid, 100, 5, Gtc), &NullSink{})
+	b.Apply(NewLimit(2, Ask, 101, 5, Gtc), &NullSink{})
+	allocs := testing.AllocsPerRun(10, func() { _ = b.RestingOrders() })
+	var m0, m1 runtime.MemStats
+	runtime.ReadMemStats(&m0)
+	for i := 0; i < 10; i++ {
+		_ = b.RestingOrders()
+	}
+	runtime.ReadMemStats(&m1)
+	if per := (m1.TotalAlloc - m0.TotalAlloc) / 10; per > 4096 {
+		t.Fatalf("RestingOrders allocated %d bytes for a 2-order book (%v allocs)", per, allocs)
 	}
 }

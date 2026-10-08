@@ -162,7 +162,7 @@ func (l *ladderIndex) sumRange(lo, hi int64) uint64 {
 func (l *ladderIndex) len() int { return l.count }
 
 func (l *ladderIndex) depth(n int) []levelDepth {
-	out := make([]levelDepth, 0, n)
+	out := make([]levelDepth, 0, min(n, l.count)) // n may be "all" (1<<30)
 	if l.side == Ask {
 		for w := 0; w < len(l.bits) && len(out) < n; w++ {
 			word := l.bits[w]
@@ -261,7 +261,7 @@ func (t *treeIndex) sumRange(lo, hi int64) uint64 {
 func (t *treeIndex) len() int { return len(t.keys) }
 
 func (t *treeIndex) depth(n int) []levelDepth {
-	out := make([]levelDepth, 0, n)
+	out := make([]levelDepth, 0, min(n, len(t.keys)))
 	if t.side == Ask {
 		for i := 0; i < len(t.keys) && len(out) < n; i++ {
 			out = append(out, levelDepth{t.keys[i], t.lvls[i].total})
