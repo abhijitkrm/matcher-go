@@ -51,7 +51,7 @@ tools/          vectorgen — deterministic workload generator
 ## Test & bench
 
 ```bash
-go test ./...       # 41 golden vectors
+go test ./...       # 43 golden vectors
 
 # benchmark (see spec/BENCH.md)
 mkdir -p bench
