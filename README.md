@@ -5,8 +5,8 @@
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
 Deterministic FIFO limit order book and matching engine core for Go —
-measured at up to **~61M orders/sec** on one core (1k-order book, batched), ~26M on the
-mixed workload, and **61M** (mixed) to **223M** (1k-order books) aggregate across 8 shards
+measured at up to **~68M orders/sec** on one core (1k-order book, batched), ~30M on the
+mixed workload, and **70M** (mixed) to **260M** (1k-order books) aggregate across 8 shards
 (see `spec/BENCH.md`).
 
 Single-writer book per symbol, commands in, monotonically sequenced events out.

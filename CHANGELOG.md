@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `replace` has a hand-expanded ladder fast path (unlink, level bookkeeping,
+  a guard that skips `cross` unless the opposite best is marketable, chunk
+  allocation and push written out): Go's calling convention spills every live
+  register around a call and the inliner budget (80) is far below the cost of
+  the helpers. The tree index keeps the generic path (`replaceGeneric`).
+  Events are built directly in the book's reused `Event` (no by-value temporary
+  and copy). PGO profile regenerated from the new code. W5 1k 60.8M -> 67.8M,
+  W4 26.5M -> 30.0M, W5 100k +9%, W5 1M +19%.
 - New hot-path layout (`../matcher/docs/LAYOUT.md`): resting orders live
   inline in 128-byte per-level chunks (`store.go`), `omap.go` gets a 1-byte
   tag array; `pool.go` and `level.go` are gone.
