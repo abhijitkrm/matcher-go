@@ -1,10 +1,10 @@
 package matcher
 
 // OrderBook is a single-writer deterministic FIFO price-time book.
-// Mirrors book.rs in matcher-rust field-for-field.
+// Data structures follow docs/LAYOUT.md (v0.3); mirrors matcher-cpp book.hpp.
 type OrderBook struct {
-	pool *pool
-	omap map[uint64]uint32 // order_id -> pool index
+	st   store
+	omap orderMap
 	bids priceIndex
 	asks priceIndex
 	seq  uint64
@@ -14,23 +14,30 @@ type OrderBook struct {
 
 func NewOrderBook(cfg BookConfig) *OrderBook {
 	b := &OrderBook{
-		pool: newPool(cfg.MaxOrders),
-		omap: make(map[uint64]uint32, cfg.MaxOrders),
+		st:   newStore(cfg.MaxOrders),
+		omap: newOrderMap(cfg.MaxOrders),
 		seq:  0,
 		cfg:  cfg,
 	}
 	if cfg.Index == IndexTree {
-		b.bids = newTreeIndex(Bid)
-		b.asks = newTreeIndex(Ask)
+		b.bids = priceIndex{tree: newTreeIndex(Bid)}
+		b.asks = priceIndex{tree: newTreeIndex(Ask)}
 	} else {
-		b.bids = newLadderIndex(Bid, cfg.PriceMin, cfg.PriceMax)
-		b.asks = newLadderIndex(Ask, cfg.PriceMin, cfg.PriceMax)
+		b.bids = priceIndex{lad: newLadderIndex(Bid, cfg.PriceMin, cfg.PriceMax)}
+		b.asks = priceIndex{lad: newLadderIndex(Ask, cfg.PriceMin, cfg.PriceMax)}
 	}
 	return b
 }
 
+// Prefault touches all order storage now (it is otherwise committed lazily
+// as the book grows). Call before latency-sensitive use; costs ~128 B of
+// resident memory per MaxOrders.
+func (b *OrderBook) Prefault() { b.st.prefault() }
+
 // Apply runs one command, emitting its event stream through sink.
-func (b *OrderBook) Apply(cmd Command, sink Sink) {
+func (b *OrderBook) Apply(cmd Command, sink Sink) { b.apply(&cmd, sink) }
+
+func (b *OrderBook) apply(cmd *Command, sink Sink) {
 	switch cmd.Kind {
 	case CmdNew:
 		b.newOrder(cmd, sink)
@@ -41,7 +48,7 @@ func (b *OrderBook) Apply(cmd Command, sink Sink) {
 	}
 }
 
-func (b *OrderBook) newOrder(cmd Command, sink Sink) {
+func (b *OrderBook) newOrder(cmd *Command, sink Sink) {
 	oid := cmd.OrderID
 	// SPEC §4.3 validation precedence.
 	if cmd.Qty == 0 {
@@ -52,11 +59,11 @@ func (b *OrderBook) newOrder(cmd Command, sink Sink) {
 		b.reject(sink, oid, InvalidPrice)
 		return
 	}
-	if _, dup := b.omap[oid]; dup {
+	if b.omap.contains(oid) {
 		b.reject(sink, oid, DuplicateOrderID)
 		return
 	}
-	if b.pool.live >= b.cfg.MaxOrders {
+	if b.st.live >= b.cfg.MaxOrders {
 		b.reject(sink, oid, BookFull)
 		return
 	}
@@ -81,7 +88,7 @@ func (b *OrderBook) newOrder(cmd Command, sink Sink) {
 	if hasBound {
 		bound = cmd.Price
 	}
-	b.cross(cmd.Side, hasBound, bound, oid, &remaining, sink)
+	remaining = b.cross(cmd.Side, hasBound, bound, oid, remaining, sink)
 
 	switch {
 	case remaining == 0:
@@ -95,29 +102,30 @@ func (b *OrderBook) newOrder(cmd Command, sink Sink) {
 }
 
 func (b *OrderBook) cancel(oid uint64, sink Sink) {
-	idx, ok := b.omap[oid]
-	if !ok {
+	e := b.omap.get(oid)
+	if e < 0 {
 		b.reject(sink, oid, UnknownOrderID)
 		return
 	}
-	o := &b.pool.slots[idx]
-	price, side := o.price, o.side
-	own := b.ownIndex(side)
+	loc := b.omap.entries[e].val
+	ch := &b.st.chunks[locChunk(loc)]
+	price := ch.price
+	own := b.ownIndex(ch.side)
 	if lv := own.levelMut(price); lv != nil {
-		b.pool.levelUnlink(lv, idx)
+		b.st.unlink(lv, loc)
 	}
 	own.unlinkLevel(price)
-	delete(b.omap, oid)
-	b.pool.free(idx)
+	b.omap.remove(oid)
 	b.emit(sink, Event{Kind: EvClosed, OrderID: oid, Reason: uint8(Cancelled)})
 }
 
 func (b *OrderBook) replace(oid uint64, price int64, qty uint64, sink Sink) {
-	idx, ok := b.omap[oid]
-	if !ok {
+	e := b.omap.get(oid)
+	if e < 0 {
 		b.reject(sink, oid, UnknownOrderID)
 		return
 	}
+	loc := b.omap.entries[e].val
 	if qty == 0 {
 		b.reject(sink, oid, InvalidQty)
 		return
@@ -126,116 +134,114 @@ func (b *OrderBook) replace(oid uint64, price int64, qty uint64, sink Sink) {
 		b.reject(sink, oid, InvalidPrice)
 		return
 	}
-	o := &b.pool.slots[idx]
-	oldPrice, oldQty, side := o.price, o.qty, o.side
+	ch := &b.st.chunks[locChunk(loc)]
+	si := locSlot(loc) % chunkSlots
+	oldPrice, oldQty, side, tif := ch.price, ch.s[si].qty, ch.side, ch.tif[si]
+	own := b.ownIndex(side)
 
 	if price == oldPrice && qty <= oldQty {
-		own := b.ownIndex(side)
 		if lv := own.levelMut(price); lv != nil {
 			lv.total -= oldQty - qty
 		}
-		b.pool.slots[idx].qty = qty
+		ch.s[si].qty = qty
 		b.emit(sink, Event{Kind: EvReplaced, OrderID: oid, Price: price, Qty: qty})
 		return
 	}
 
-	// Priority loss: unlink + re-enter aggressive GTC limit path.
-	own := b.ownIndex(side)
+	// Leave the book (losing time priority), re-cross at the new price, rest
+	// any remainder at the back of the new level. The map entry is kept
+	// across cross() so the id stays reserved; it is rewritten (or removed)
+	// afterwards because cross() may move map entries.
 	if lv := own.levelMut(oldPrice); lv != nil {
-		b.pool.levelUnlink(lv, idx)
+		b.st.unlink(lv, loc)
 	}
 	own.unlinkLevel(oldPrice)
-	o = &b.pool.slots[idx]
-	o.price = price
-	o.qty = qty
 
-	remaining := qty
-	b.cross(side, true, price, oid, &remaining, sink)
+	removes := b.omap.removes
+	remaining := b.cross(side, true, price, oid, qty, sink)
 
 	if remaining == 0 {
-		delete(b.omap, oid)
-		b.pool.free(idx)
+		b.omap.remove(oid)
 		b.emit(sink, Event{Kind: EvClosed, OrderID: oid, Reason: uint8(Filled)})
 		return
 	}
-	b.pool.slots[idx].qty = remaining
-	lv := own.levelInsert(price)
-	b.pool.levelPush(lv, idx)
+	nloc := b.st.push(own.levelInsert(price), side, price, oid, remaining, tif)
+	if b.omap.removes == removes {
+		b.omap.entries[e].val = nloc // no entry moved: skip the re-probe
+	} else {
+		b.omap.insert(oid, nloc)
+	}
 	b.emit(sink, Event{Kind: EvReplaced, OrderID: oid, Price: price, Qty: remaining})
 }
 
-// cross walks the opposite side, mutating *qty down to what is left.
+// cross walks the opposite side and returns the quantity left of qty.
 // hasBound=false means market (match all available depth).
-func (b *OrderBook) cross(side Side, hasBound bool, bound int64, taker uint64, qty *uint64, sink Sink) {
-	var opp priceIndex
+func (b *OrderBook) cross(side Side, hasBound bool, bound int64, taker uint64, qty uint64, sink Sink) uint64 {
+	opp := b.bids
 	if side == Bid {
 		opp = b.asks
-	} else {
-		opp = b.bids
 	}
 	for {
 		bp, ok := opp.bestPrice()
 		if !ok {
-			return
+			return qty
 		}
 		if hasBound {
 			if side == Bid && bp > bound {
-				return
+				return qty
 			}
 			if side == Ask && bp < bound {
-				return
+				return qty
 			}
 		}
 		lv := opp.levelMut(bp)
 		if lv == nil {
-			return
+			return qty
 		}
-		for {
-			mi := lv.head
-			if mi == NIL {
-				break
+		for lv.head != NIL {
+			c := lv.head
+			ch := &b.st.chunks[c]
+			// front: advance the head chunk's cursor past dead slots (the
+			// head chunk always holds a live slot).
+			h := ch.head % chunkSlots
+			for ch.s[h].qty == 0 {
+				h = (h + 1) % chunkSlots
 			}
-			m := &b.pool.slots[mi]
+			ch.head = h
+			m := &ch.s[h]
 			mid, mqty := m.id, m.qty
-			q := *qty
-			if mqty < q {
-				q = mqty
-			}
+			q := min(qty, mqty)
 			b.emit(sink, Event{Kind: EvTrade, Maker: mid, Taker: taker, Price: bp, Qty: q})
 			lv.total -= q
 			m.qty = mqty - q
-			*qty -= q
+			qty -= q
 			if mqty == q {
-				b.pool.levelUnlink(lv, mi)
-				delete(b.omap, mid)
-				b.pool.free(mi)
+				// m.qty == 0: the slot is now dead.
+				b.st.live--
+				ch.live--
+				if ch.live == 0 {
+					b.st.dropChunk(lv, c)
+				}
+				b.omap.remove(mid)
 				b.emit(sink, Event{Kind: EvClosed, OrderID: mid, Reason: uint8(Filled)})
 			}
-			if *qty == 0 {
+			if qty == 0 {
 				break
 			}
 		}
 		if lv.empty() {
 			opp.unlinkLevel(bp)
 		}
-		if *qty == 0 {
-			return
+		if qty == 0 {
+			return 0
 		}
 	}
 }
 
-// rest inserts a remainder as a resting order (slot guaranteed by book_full).
+// rest inserts a remainder as a resting order (room guaranteed by book_full).
 func (b *OrderBook) rest(oid uint64, side Side, price int64, qty uint64, tif Tif) {
-	idx, ok := b.pool.alloc()
-	if !ok {
-		// Unreachable: ingest checked live < MaxOrders and matching only frees.
-		return
-	}
-	b.pool.slots[idx] = order{id: oid, side: side, price: price, qty: qty, tif: tif, prev: NIL, next: NIL}
-	own := b.ownIndex(side)
-	lv := own.levelInsert(price)
-	b.pool.levelPush(lv, idx)
-	b.omap[oid] = idx
+	loc := b.st.push(b.ownIndex(side).levelInsert(price), side, price, oid, qty, tif)
+	b.omap.insert(oid, loc)
 }
 
 func (b *OrderBook) ownIndex(side Side) priceIndex {
@@ -298,7 +304,7 @@ type OrderInfo struct {
 
 func (b *OrderBook) BestBid() (int64, bool) { return b.bids.bestPrice() }
 func (b *OrderBook) BestAsk() (int64, bool) { return b.asks.bestPrice() }
-func (b *OrderBook) OrderCount() int        { return b.pool.live }
+func (b *OrderBook) OrderCount() int        { return b.st.live }
 func (b *OrderBook) Seq() uint64            { return b.seq }
 func (b *OrderBook) LevelCount(s Side) int  { return b.ownIndex(s).len() }
 func (b *OrderBook) Depth(s Side, n int) []levelDepth {
@@ -306,12 +312,14 @@ func (b *OrderBook) Depth(s Side, n int) []levelDepth {
 }
 
 func (b *OrderBook) Order(oid uint64) (OrderInfo, bool) {
-	idx, ok := b.omap[oid]
-	if !ok {
+	e := b.omap.get(oid)
+	if e < 0 {
 		return OrderInfo{}, false
 	}
-	o := &b.pool.slots[idx]
-	return OrderInfo{OrderID: o.id, Side: o.side, Price: o.price, Qty: o.qty}, true
+	loc := b.omap.entries[e].val
+	ch := &b.st.chunks[locChunk(loc)]
+	o := &ch.s[locSlot(loc)]
+	return OrderInfo{OrderID: o.id, Side: ch.side, Price: ch.price, Qty: o.qty}, true
 }
 
 // RestingOrder is one live order for snapshot serialization.
@@ -326,17 +334,17 @@ type RestingOrder struct {
 // RestingOrders returns all live orders in book order: bids best→worst then
 // asks best→worst, FIFO within each level.
 func (b *OrderBook) RestingOrders() []RestingOrder {
-	out := make([]RestingOrder, 0, b.pool.live)
+	out := make([]RestingOrder, 0, b.st.live)
 	for _, side := range []Side{Bid, Ask} {
 		idx := b.ownIndex(side)
 		for _, d := range idx.depth(1 << 30) {
-			lv := idx.levelMut(d.Price)
-			for i := lv.head; i != NIL; i = b.pool.slots[i].next {
-				o := &b.pool.slots[i]
+			b.st.forEach(idx.levelMut(d.Price), func(loc uint32) {
+				ch := &b.st.chunks[locChunk(loc)]
+				i := locSlot(loc)
 				out = append(out, RestingOrder{
-					OrderID: o.id, Side: o.side, Price: o.price, Qty: o.qty, Tif: o.tif,
+					OrderID: ch.s[i].id, Side: side, Price: ch.price, Qty: ch.s[i].qty, Tif: ch.tif[i],
 				})
-			}
+			})
 		}
 	}
 	return out
@@ -348,16 +356,10 @@ func Restore(cfg BookConfig, seq uint64, orders []RestingOrder) *OrderBook {
 	b := NewOrderBook(cfg)
 	b.seq = seq
 	for _, o := range orders {
-		idx, ok := b.pool.alloc()
-		if !ok {
-			return b
+		if b.st.live >= cfg.MaxOrders {
+			break
 		}
-		b.pool.slots[idx] = order{
-			id: o.OrderID, side: o.Side, price: o.Price, qty: o.Qty,
-			tif: o.Tif, prev: NIL, next: NIL,
-		}
-		b.pool.levelPush(b.ownIndex(o.Side).levelInsert(o.Price), idx)
-		b.omap[o.OrderID] = idx
+		b.rest(o.OrderID, o.Side, o.Price, o.Qty, o.Tif)
 	}
 	return b
 }

@@ -1,18 +1,30 @@
 // matcherbench — spec/BENCH.md measurement protocol (Go).
 //
-//	matcherbench <corpus-prefix> [--tag name]
+//	matcherbench <corpus-prefix> [--tag name] [--mode latency|throughput|scale]
+//	             [--threads N] [--reps R] [--cpuprofile file]
 //
 // Loads <prefix>.setup.cmd.jsonl (untimed) + <prefix>.run.cmd.jsonl (measured),
-// prints one RESULTS.md row. Parsing before timing; all per-op latencies (ns)
-// stored, sorted, reported exactly.
+// prints one RESULTS.md row (BENCH.md §2.1 modes). Parsing before timing.
+//
+//	latency    (default) per-op timed Apply; all per-op latencies (ns)
+//	           stored, sorted, reported exactly.
+//	throughput untimed batch replay of the whole run, one warmup + R reps.
+//	scale      N goroutines, each locked to its own OS thread and owning a
+//	           private book, replaying the corpus as its own symbol
+//	           partition; aggregate = N*ops / slowest shard's wall time.
 package main
 
 import (
 	"bufio"
 	"fmt"
 	"os"
+	"runtime"
+	"runtime/pprof"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	matcher "github.com/abhijitkrm/matcher-go"
@@ -139,26 +151,20 @@ func pct(sorted []uint64, p float64) uint64 {
 	return sorted[i]
 }
 
-func main() {
-	args := os.Args[1:]
-	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: matcherbench <corpus-prefix> [--tag name]")
-		os.Exit(2)
-	}
-	prefix := args[0]
-	tag := prefix
-	if i := strings.LastIndex(prefix, "/"); i >= 0 {
-		tag = prefix[i+1:]
-	}
-	for i, a := range args {
-		if a == "--tag" && i+1 < len(args) {
-			tag = args[i+1]
-		}
-	}
+// replay runs one untimed batched pass on a fresh book; returns run seconds.
+func replay(cfg matcher.BookConfig, setup, run []matcher.Command, acc *uint64) float64 {
+	book := matcher.NewOrderBook(cfg)
+	prefault(book)
+	sink := &matcher.NullSink{}
+	applyBatch(book, setup, sink)
+	t0 := time.Now()
+	applyBatch(book, run, sink)
+	s := time.Since(t0).Seconds()
+	*acc += sink.Acc
+	return s
+}
 
-	cfg, setup := load(prefix + ".setup.cmd.jsonl")
-	_, run := load(prefix + ".run.cmd.jsonl")
-
+func latencyMode(tag string, cfg matcher.BookConfig, setup, run []matcher.Command) {
 	// Warmup: throwaway book, setup + first 10% of run.
 	{
 		book := matcher.NewOrderBook(cfg)
@@ -174,6 +180,7 @@ func main() {
 
 	// Timed pass.
 	book := matcher.NewOrderBook(cfg)
+	prefault(book)
 	sink := &matcher.NullSink{}
 	for _, c := range setup {
 		book.Apply(c, sink)
@@ -199,5 +206,135 @@ func main() {
 
 	fmt.Printf("| %s | %d | %.0f | %d | %d | %d | %d | %d | %d |\n",
 		tag, ops, opsS, mean, pct(lat, .50), pct(lat, .90), pct(lat, .99), pct(lat, .999), lat[len(lat)-1])
-	fmt.Fprintf(os.Stderr, "env: arm64 / darwin / go\n")
+}
+
+func throughputMode(tag string, cfg matcher.BookConfig, setup, run []matcher.Command, reps int) {
+	runtime.LockOSThread()
+	highQoS()
+	var acc uint64
+	replay(cfg, setup, run, &acc) // warmup
+	t := make([]float64, 0, reps)
+	for r := 0; r < reps; r++ {
+		t = append(t, replay(cfg, setup, run, &acc))
+	}
+	sinkAcc = acc
+	sort.Float64s(t)
+	ops := float64(len(run))
+	med := t[len(t)/2]
+	fmt.Printf("| %s | throughput | 1 | %d | %.0f | %.0f | %.2f |\n",
+		tag, len(run), ops/t[0], ops/med, 1e9*med/ops)
+}
+
+func scaleMode(tag string, cfg matcher.BookConfig, setup, run []matcher.Command, threads, reps int) {
+	agg := make([]float64, 0, reps)
+	for r := 0; r < reps+1; r++ { // rep 0 is warmup
+		var ready atomic.Int32
+		var gate atomic.Bool
+		wall := make([]float64, threads)
+		accs := make([]uint64, threads)
+		var wg sync.WaitGroup
+		for t := 0; t < threads; t++ {
+			wg.Add(1)
+			go func(t int) {
+				defer wg.Done()
+				runtime.LockOSThread()
+				highQoS()
+				// Book built on its own thread: first touch places its pages.
+				book := matcher.NewOrderBook(cfg)
+				prefault(book)
+				sink := &matcher.NullSink{}
+				applyBatch(book, setup, sink)
+				ready.Add(1)
+				for !gate.Load() {
+				}
+				t0 := time.Now()
+				applyBatch(book, run, sink)
+				wall[t] = time.Since(t0).Seconds()
+				accs[t] = sink.Acc
+			}(t)
+		}
+		for int(ready.Load()) < threads {
+			runtime.Gosched()
+		}
+		gate.Store(true)
+		wg.Wait()
+		for _, a := range accs {
+			sinkAcc += a
+		}
+		if r > 0 {
+			slowest := 0.0
+			for _, w := range wall {
+				if w > slowest {
+					slowest = w
+				}
+			}
+			agg = append(agg, float64(threads)*float64(len(run))/slowest)
+		}
+	}
+	sort.Float64s(agg)
+	med := agg[len(agg)/2]
+	fmt.Printf("| %s | scale | %d | %d | %.0f | %.0f | %.0f |\n",
+		tag, threads, len(run), agg[len(agg)-1], med, med/float64(threads))
+}
+
+// sinkAcc keeps every replay's NullSink fold observable.
+var sinkAcc uint64
+
+func main() {
+	args := os.Args[1:]
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: matcherbench <corpus-prefix> [--tag name] "+
+			"[--mode latency|throughput|scale] [--threads N] [--reps R]")
+		os.Exit(2)
+	}
+	prefix := args[0]
+	tag := prefix
+	if i := strings.LastIndex(prefix, "/"); i >= 0 {
+		tag = prefix[i+1:]
+	}
+	mode, threads, reps, prof := "latency", runtime.NumCPU(), 5, ""
+	for i := 1; i+1 < len(args); i++ {
+		switch args[i] {
+		case "--tag":
+			tag = args[i+1]
+		case "--mode":
+			mode = args[i+1]
+		case "--threads":
+			threads, _ = strconv.Atoi(args[i+1])
+		case "--reps":
+			reps, _ = strconv.Atoi(args[i+1])
+		case "--cpuprofile": // e.g. to refresh default.pgo
+			prof = args[i+1]
+		}
+	}
+	threads = max(threads, 1)
+	reps = max(reps, 1)
+
+	cfg, setup := load(prefix + ".setup.cmd.jsonl")
+	_, run := load(prefix + ".run.cmd.jsonl")
+
+	if prof != "" {
+		f, err := os.Create(prof)
+		if err != nil {
+			panic(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
+
+	switch mode {
+	case "throughput":
+		throughputMode(tag, cfg, setup, run, reps)
+	case "scale":
+		scaleMode(tag, cfg, setup, run, threads, reps)
+	default:
+		mode = "latency"
+		latencyMode(tag, cfg, setup, run)
+	}
+	gc := os.Getenv("GOGC")
+	if gc == "" {
+		gc = "default"
+	}
+	fmt.Fprintf(os.Stderr, "env: %s / %s / %s GOGC=%s (%s)\n",
+		runtime.GOARCH, runtime.GOOS, runtime.Version(), gc, mode)
 }

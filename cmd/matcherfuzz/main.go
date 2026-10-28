@@ -138,13 +138,17 @@ func main() {
 		buf = append(buf, '\n')
 		out.Write(buf)
 	})
+	// Single-book corpora go through the batch entry point, which must emit
+	// the same stream as per-command Apply (BENCH.md §2.1).
+	var cmds []matcher.Command
 	for sc.Scan() {
 		line := sc.Text()
 		if line == "" {
 			continue
 		}
-		book.Apply(parseCmd(line), sink)
+		cmds = append(cmds, parseCmd(line))
 	}
+	book.ApplyBatch(cmds, sink)
 }
 
 type fnSink func(uint64, *matcher.Event)

@@ -5,19 +5,82 @@ import (
 	"sort"
 )
 
-// priceIndex abstracts the price -> level index (SPEC §2). Two impls:
-//   - ladderIndex: direct-indexed + bitmap + top-of-book cursor (hot path)
-//   - treeIndex: sorted-slice fallback for unbounded/sparse domains
+// priceIndex is the price -> level index (SPEC §2): exactly one of
+//   - lad:  direct-indexed + bitmap + top-of-book cursor (hot path)
+//   - tree: sorted-slice fallback for unbounded/sparse domains
 //
-// Semantics identical; choice is performance/memory only.
-type priceIndex interface {
-	bestPrice() (int64, bool)
-	levelMut(price int64) *level    // existing non-empty level or nil
-	levelInsert(price int64) *level // get-or-create
-	unlinkLevel(price int64)        // drop bookkeeping if emptied
-	sumRange(lo, hi int64) uint64   // FOK fillability
-	len() int
-	depth(n int) []levelDepth
+// Semantics identical; choice is performance/memory only. A struct with a
+// nil check rather than an interface so the ladder calls inline (the C++
+// reference uses the same enum dispatch).
+type priceIndex struct {
+	lad  *ladderIndex
+	tree *treeIndex
+}
+
+func (p priceIndex) bestPrice() (int64, bool) {
+	if p.lad != nil {
+		return p.lad.bestPrice()
+	}
+	return p.tree.bestPrice()
+}
+
+// levelMut returns the existing non-empty level or nil.
+func (p priceIndex) levelMut(price int64) *level {
+	if p.lad != nil {
+		return p.lad.levelMut(price)
+	}
+	return p.tree.levelMut(price)
+}
+
+// levelInsert gets or creates the level.
+func (p priceIndex) levelInsert(price int64) *level {
+	if p.lad != nil {
+		return p.lad.levelInsert(price)
+	}
+	return p.tree.levelInsert(price)
+}
+
+// unlinkLevel drops bookkeeping if the level emptied.
+func (p priceIndex) unlinkLevel(price int64) {
+	if p.lad != nil {
+		p.lad.unlinkLevel(price)
+		return
+	}
+	p.tree.unlinkLevel(price)
+}
+
+func (p priceIndex) sumRange(lo, hi int64) uint64 {
+	if p.lad != nil {
+		return p.lad.sumRange(lo, hi)
+	}
+	return p.tree.sumRange(lo, hi)
+}
+
+func (p priceIndex) len() int {
+	if p.lad != nil {
+		return p.lad.len()
+	}
+	return p.tree.len()
+}
+
+func (p priceIndex) depth(n int) []levelDepth {
+	if p.lad != nil {
+		return p.lad.depth(n)
+	}
+	return p.tree.depth(n)
+}
+
+// peek returns the ladder slot for price (empty or not) for look-ahead
+// loads, or nil (out of range, or tree index).
+func (p priceIndex) peek(price int64) *level {
+	if p.lad == nil {
+		return nil
+	}
+	i := uint64(price - p.lad.base)
+	if i >= uint64(len(p.lad.levels)) {
+		return nil
+	}
+	return &p.lad.levels[i]
 }
 
 type levelDepth struct {
@@ -97,10 +160,15 @@ func (l *ladderIndex) levelInsert(price int64) *level {
 
 func (l *ladderIndex) unlinkLevel(price int64) {
 	i := l.idx(price)
-	lv := &l.levels[i]
-	if lv.head != NIL {
+	if l.levels[i].head != NIL {
 		return
 	}
+	l.clear(i)
+}
+
+// clear drops the occupancy of the emptied level i (kept out of line so
+// unlinkLevel's not-empty early return inlines).
+func (l *ladderIndex) clear(i int) {
 	w := i / 64
 	l.bits[w] &^= 1 << (uint(i) % 64)
 	if l.bits[w] == 0 {
